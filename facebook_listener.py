@@ -42,7 +42,7 @@ class FacebookListener(Listener):
         self.client = MongoClient(nosqldb_host, nosqldb_port)
         self.db = self.client[nosqldb_name]
 
-    def get_comments(self, post_id):
+    def get_comments(self, page_id):
         """
         Get all the comments for a post
 
@@ -62,11 +62,41 @@ class FacebookListener(Listener):
             error: Authentication error
         """
         if self.access_token is not None:
-            comments = self.db.comments
-            comments_in_db = comments.count()
-            for comment in self.graph.get_connections(post_id, 'comments', fields='comments', summary=1):
-                comments.insert_one(comment)
-            print(str(comments.count() - comments_in_db) + " comments saved to the database.")
+            comments_in_db = self.db.comments.count()
+            fb_page = self.graph.get_object(page_id)
+
+            # if page not exists create a new entry
+            page_obj = self.db.pages.find_one({'id': fb_page['id']})
+            if page_obj is None:
+                print("Page not found in the database")
+                return
+
+            # for the page_id, get posts
+            posts = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}})
+
+            # for each post check if comments exist
+            import pdb; pdb.set_trace()
+            for post in posts:
+                if 'comments' in post:
+                    continue
+                else:
+                    # if not, call graph api and update
+                    args = {'fields': 'comments,id,message,comment_count,like_count,from,likes.summary(1)',
+                            'summary': 1}
+                    comments_page = []
+                    while True:
+                        page = self.graph.get_connections(post['id'], 'comments', **args)
+                        comments_page += page['data']
+                        summary = page['summary']
+                        next = page.get('paging', {}).get('next')
+                        if not next:
+                            comments_obj = {'data': comments_page, 'summary': summary}
+                            self.db.posts.update_one({'id': post['id']}, {'$set': {'comments': comments_obj}})
+                            break
+                        args = parse_qs(urlparse(next).query)
+                        del args['access_token']
+
+            print(str(self.db.comments.count() - comments_in_db) + " comments saved to the database.")
 
         else:
             raise ValueError("Not Authenticated.")
@@ -113,6 +143,9 @@ class FacebookListener(Listener):
             https://www.facebook.com/BillGates/
             group_id: free.code.camp.hyderabad
             https://www.facebook.com/groups/free.code.camp.hyderabad/
+            
+        since: Scraping start from now and will stop at this date (inclusive)
+        until: Scraping will start at this date (inclusive) and get older posts
 
         Returns
         -------
@@ -124,6 +157,9 @@ class FacebookListener(Listener):
         page = None
         new_page = False
         limit = 100
+        until = self.get_unix_timestamp(until)
+        since = self.get_unix_timestamp(since)
+
         try:
             if self.access_token is not None:
                 self.post_ids = []
@@ -135,8 +171,13 @@ class FacebookListener(Listener):
                     new_page = True
                     page_obj = self.db.pages.find_one({'_id': self.create_page(fb_page['id']).inserted_id})
 
-                posts = self.db.posts
-                posts_in_db = posts.count()
+                posts_in_db = self.db.posts.count()
+                existing_posts = self.db.pages.find_one({'_id': page_obj['_id']})
+                existing_posts_count = 0
+                if 'nposts' in existing_posts:
+                    existing_posts_count = existing_posts['nposts']
+                    if existing_posts_count == 0:
+                        existing_posts_count = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}}).count()
 
                 fields_to_scrape = 'message,created_time,place,type,permalink_url,' \
                                    'comments.limit(0).summary(total_count),shares,' \
@@ -151,46 +192,93 @@ class FacebookListener(Listener):
 
                 # if not scraping for the first time, scrape until the oldest date
                 if not new_page:
-                    print(page_id + " has " + str(posts_in_db) + " posts.")
-                    oldest_post = self.db.posts.find().sort('created_time', pymongo.ASCENDING).limit(1)
+                    print(page_id + " has " + str(existing_posts_count) + " posts.")
+                    oldest_post = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}}) \
+                        .sort('created_time', pymongo.ASCENDING).limit(1)
                     if oldest_post.count() > 0:
                         oldest_post_date = oldest_post[0]['created_time']
-                        until = "%.0f" % time.mktime(
+                        until_in_db = time.mktime(
                             datetime.strptime(oldest_post_date, '%Y-%m-%dT%H:%M:%S+0000').timetuple())
+
+                        # if we have a few posts already scraped for the specified date (until)
+                        if until != '':
+                            if until > until_in_db:
+                                until = until_in_db
+
+                    if 'latest_date' in page_obj:
+                        latest_post_date = page_obj['latest_date']
+                        print("till " + latest_post_date)
+                    else:
+                        latest_post = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}}) \
+                            .sort('created_time', pymongo.ASCENDING).limit(1)
+                        if latest_post.count() > 0:
+                            latest_post_date = latest_post[0]['created_time']
+                            since_in_db = time.mktime(
+                                datetime.strptime(latest_post_date, '%Y-%m-%dT%H:%M:%S+0000').timetuple())
+
+                            if since != '' and since < since_in_db:
+                                since = since_in_db
 
                 # comments_thread = threading.Thread(target=self.get_comments)
                 # comments_thread.daemon = True
                 # comments_thread.start()
 
-                print("Scraping posts for " + page_id)
+                # import pdb; pdb.set_trace()
+                print("Scraping posts for " + page_id + ' dates : ' + ', '.join([d for d in [str(since), str(until)]]))
                 count = 0
-                args = {'fields': fields_to_scrape, 'limit': limit, 'until': until}
+                args = {'fields': fields_to_scrape, 'limit': limit, 'since': since, 'until': until}
                 while True:
                     count += 1
                     page = self.graph.get_connections(fb_page['id'], 'posts', **args)
+
                     if len(page['data']) > 0:
                         print(count, "date: ", page['data'][0]['created_time'])
-                        posts.insert_many(page['data'])
 
-                        # latest date is the first entry in the response
+                        # unique_posts_since = 0
+                        # if since != '':
+                        #     since_datetime = datetime.fromtimestamp(since)
+                        #     while datetime.strptime(page['data'][unique_posts_since]['created_time'],
+                        #                             '%Y-%m-%dT%H:%M:%S+0000') > since_datetime:
+                        #         unique_posts_since += 1
+                        #
+                        # unique_posts_until = 0
+                        # if until != '':
+                        #     until_datetime = datetime.fromtimestamp(until)
+                        #     while datetime.strptime(page['data'][unique_posts_until]['created_time'],
+                        #                             '%Y-%m-%dT%H:%M:%S+0000') < until_datetime:
+                        #         unique_posts_until += 1
+                        #
+                        # if unique_posts_since > 0:
+                        #     self.db.posts.insert_many(page['data'][0:unique_posts_since])
+                        # if unique_posts_until > 0:
+                        #     self.db.posts.insert_many(page['data'][0:unique_posts_until])
+
+                        self.db.posts.insert_many(page['data'])
+
+                        # latest date is the first entry in the response array
                         if new_page and count == 1:
                             self.db.pages.update_one({'_id': page_obj['_id']},
                                                      {'$set': {'latest_date': page['data'][0]['created_time']}})
                     else:
                         print("No new posts for " + page_id)
+
                     next = page.get('paging', {}).get('next')
+
                     # self.post_ids += [post_obj['id'] for post_obj in page['data']]
                     if not next:
-                        print(str(posts.count() - posts_in_db) + " posts added to the database. Now, we have " + str(
-                            posts.count()) + " Posts")
+                        new_posts_count = self.db.posts.count() - posts_in_db
+                        self.db.pages.update_one({'_id': page_obj['_id']},
+                                                 {'$set': {'nposts': existing_posts_count + new_posts_count}})
+                        print(str(new_posts_count) + " posts added to the database. All posts in DB: " + str(
+                            self.db.posts.count()) + "\n")
                         return
+
                     args = parse_qs(urlparse(next).query)
                     args['fields'] = fields_to_scrape
                     args['limit'] = limit
                     args['since'] = since
                     args['until'] = until
                     del args['access_token']
-                    # print(str(len(page['data'])) + ' posts saved to the database.')
             else:
                 raise ValueError("Not Authenticated.")
 
@@ -205,6 +293,12 @@ class FacebookListener(Listener):
             if page_obj and page:
                 self.db.pages.update_one({'_id': page_obj['_id']},
                                          {'$set': {'error_date': page['data'][-1]['created_time']}})
+
+    def get_unix_timestamp(self, date_string):
+        timestamp = ''
+        if date_string != '':
+            timestamp = time.mktime(datetime.strptime(date_string, '%Y-%m-%dT%H:%M:%S+0000').timetuple())
+        return timestamp
 
     def create_page(self, page_id):
         page_meta = 'id,name,about,global_brand_page_name,category,description,display_subtext,emails,' \

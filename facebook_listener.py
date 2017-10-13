@@ -44,22 +44,18 @@ class FacebookListener(Listener):
 
     def get_comments(self, page_id):
         """
-        Get all the comments for a post
+        Scrape all the comments for a page
 
         Parameters
         ----------
-        post_id : str
-            it is found in the response from get_posts
-            e.g.: 216311481960_10154158548531961
-            you can create it from the facebook post url by concatenating user id and the post id
-            For this particular post, BillGates page user id is 216311481960 and 
-            https://www.facebook.com/BillGates/posts/10154158548531961 is the post url
+        page_id : str
+            e.g.: BillGates
         
         Returns
         -------
-        Iterator:
-            Iterator for posts
-            error: Authentication error
+        None
+            
+        error: Authentication error
         """
         if self.access_token is not None:
             comments_in_db = self.db.comments.count()
@@ -75,8 +71,11 @@ class FacebookListener(Listener):
             posts = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}})
 
             # for each post check if comments exist
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
+            i = 0
+            ncomments = 0
             for post in posts:
+                i += 1
                 if 'comments' in post:
                     continue
                 else:
@@ -95,8 +94,12 @@ class FacebookListener(Listener):
                             break
                         args = parse_qs(urlparse(next).query)
                         del args['access_token']
+                        ncomments += summary['total_count']
 
-            print(str(self.db.comments.count() - comments_in_db) + " comments saved to the database.")
+                if i % 1000 == 0:
+                    print(str(i) + ' comments scraped')
+
+            print(str(ncomments) + " comments saved to the database.")
 
         else:
             raise ValueError("Not Authenticated.")
@@ -180,7 +183,7 @@ class FacebookListener(Listener):
                         existing_posts_count = self.db.posts.find({'id': {'$regex': fb_page['id'] + '.*'}}).count()
 
                 fields_to_scrape = 'message,created_time,place,type,permalink_url,' \
-                                   'comments.limit(0).summary(total_count),shares,' \
+                                   'comments.limit(0).summary(total_count).as(ncomments),shares,' \
                                    'reactions.type(LIKE).limit(0).summary(total_count).as(nlikes),' \
                                    'reactions.type(LOVE).limit(0).summary(total_count).as(nloves),' \
                                    'reactions.type(WOW).limit(0).summary(total_count).as(nwows),' \
